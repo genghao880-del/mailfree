@@ -240,6 +240,82 @@ export async function handleMailboxAdminApi(request, db, url, path, options) {
       return errorResponse('操作失败: ' + e.message, 500);
     }
   }
+// 批量删除邮箱
+if (path === '/api/mailboxes/batch-delete' && request.method === 'DELETE') {
+  if (isMock) return errorResponse('演示模式不可删除', 403);
+  if (!isStrictAdmin(request, options)) {
+    // 普通 admin 也可调用，但后续会校验归属权
+    const payload = getJwtPayload(request, options);
+    if (!payload || payload.role !== 'admin') return errorResponse('Forbidden', 403);
+  }
+  try {
+    const body = await request.json();
+    const addresses = body.addresses || [];
+    if (!Array.isArray(addresses) || addresses.length === 0) {
+      return errorResponse('缺少 addresses 参数或地址列表为空', 400);
+    }
+    if (addresses.length > 100) {
+      return errorResponse('单次最多删除100个邮箱', 400);
+    }
+
+    let successCount = 0;
+    let failCount = 0;
+    const results = [];
+
+    for (const address of addresses) {
+      const normalized = String(address || '').trim().toLowerCase();
+      if (!normalized) {
+        failCount++;
+        results.push({ address, success: false, error: '地址为空' });
+        continue;
+      }
+      try {
+        const mailboxId = await getMailboxIdByAddress(db, normalized);
+        if (!mailboxId) {
+          failCount++;
+          results.push({ address: normalized, success: false, error: '邮箱不存在' });
+          continue;
+        }
+        // 非严格管理员需校验邮箱归属权
+        if (!isStrictAdmin(request, options)) {
+          const payload = getJwtPayload(request, options);
+          const own = await db.prepare('SELECT 1 FROM user_mailboxes WHERE user_id = ? AND mailbox_id = ? LIMIT 1')
+            .bind(Number(payload.userId), mailboxId).all();
+          if (!own?.results?.length) {
+            failCount++;
+            results.push({ address: normalized, success: false, error: '无权限' });
+            continue;
+          }
+        }
+        try { await db.exec('BEGIN'); } catch (_) {}
+        await db.prepare('DELETE FROM messages WHERE mailbox_id = ?').bind(mailboxId).run();
+        const del = await db.prepare('DELETE FROM mailboxes WHERE id = ?').bind(mailboxId).run();
+        try { await db.exec('COMMIT'); } catch (_) {}
+        const deleted = (del?.meta?.changes || 0) > 0;
+        if (deleted) {
+          invalidateMailboxCache(normalized);
+          invalidateSystemStatCache('total_mailboxes');
+        }
+        successCount++;
+        results.push({ address: normalized, success: true });
+      } catch (e) {
+        try { await db.exec('ROLLBACK'); } catch (_) {}
+        failCount++;
+        results.push({ address: normalized, success: false, error: e.message });
+      }
+    }
+
+    return Response.json({
+      success: failCount === 0,
+      success_count: successCount,
+      fail_count: failCount,
+      total: addresses.length,
+      results
+    });
+  } catch (e) {
+    return errorResponse('批量删除失败: ' + e.message, 500);
+  }
+}
 
   // ====== 邮箱设置：转发和收藏 ======
   if (path === '/api/mailbox/forward' && request.method === 'POST') {
